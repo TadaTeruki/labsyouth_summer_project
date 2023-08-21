@@ -7,12 +7,15 @@ LIBS=\
 
 all: build run
 
+.PHONY: build
 build:
 	gcc -o main -DWLR_USE_UNSTABLE $(LIBS) -I . main.c 
 
+.PHONY: run
 run:
 	./main
 
+.PHONY: xdg-shell-protocol.h
 xdg-shell-protocol.h:
 	$(WAYLAND_SCANNER) server-header \
 		$(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml $@
