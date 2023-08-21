@@ -19,3 +19,7 @@ run:
 xdg-shell-protocol.h:
 	$(WAYLAND_SCANNER) server-header \
 		$(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml $@
+
+.PHONY: format
+format:
+	clang-format -i -style="{BasedOnStyle: llvm, IndentWidth: 4, UseTab: Never, ColumnLimit: 0}" *.c
