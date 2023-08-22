@@ -5,11 +5,12 @@
 #include <wlr/backend.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
+#include <xkbcommon/xkbcommon.h>
 
 // waylandサーバー
 struct morning_server {
 
-    // wayland display
+    // waylandディスプレイ
     struct wl_display *display;
     // デバイスとの入出力を抽象化 (DRM, libinput, X11など)
     struct wlr_backend *backend;
@@ -34,15 +35,66 @@ struct morning_keyboard {
     struct wlr_keyboard *wlr_keyboard;
 
     // キーボードからの入力を検知するlistener
-    struct wl_listener keyboard_input;
+    struct wl_listener input;
+    // サーバーの終了を検知するlistener
+    struct wl_listener destroy;
 
     // リスト用
     struct wl_list link;
 };
 
+// Altキーによるキーバインドを処理
+static int handle_keybinding_alt(struct morning_server *server, xkb_keysym_t sym) {
+    printf("detected keybinding [alt]\n");
+    switch (sym) {
+    // Alt + Escape: 終了
+    case XKB_KEY_Escape:
+        wl_display_terminate(server->display);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 // キーボードからの入力を受け取ったときのイベント
 static void handle_keyboard_input(struct wl_listener *listener, void *data) {
     printf("detected keyboard input\n");
+    struct morning_keyboard *keyboard = wl_container_of(listener, keyboard, input);
+    struct wlr_keyboard_key_event *event = data;
+
+    // libinputのキーコードをXKBのキーコードに変換
+    uint32_t keycode = event->keycode + 8;
+
+    // XKBのキーコードからキーのシンボルを取得 (nsymsはシンボルの数)
+    const xkb_keysym_t *syms;
+    int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode, &syms);
+
+    // 押されている修飾キーを取得
+    uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+    int handled = 0;
+
+    // 各シンボルの内容を解釈し、キーバインドを処理
+    for (int i = 0; i < nsyms; i++) {
+        switch (event->state) {
+        case WL_KEYBOARD_KEY_STATE_PRESSED:
+            // Alt + ?
+            if (modifiers & WLR_MODIFIER_ALT)
+                handled = handle_keybinding_alt(keyboard->server, syms[i]);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+// キーボードの接続が切れたときのイベント
+static void handle_keyboard_destroy(struct wl_listener *listener, void *data) {
+    struct morning_keyboard *keyboard = wl_container_of(listener, keyboard, destroy);
+    printf("detected keyboard destroy\n");
+    wl_list_remove(&keyboard->input.link);
+    wl_list_remove(&keyboard->destroy.link);
+    wl_list_remove(&keyboard->link);
+    free(keyboard);
 }
 
 // キーボードの初期化
@@ -64,8 +116,10 @@ static void server_new_keyboard(struct morning_server *server, struct wlr_input_
     keyboard->wlr_keyboard = wlr_keyboard;
 
     // キーボードのイベントを指定
-    keyboard->keyboard_input.notify = handle_keyboard_input;
-    wl_signal_add(&wlr_keyboard->events.key, &keyboard->keyboard_input);
+    keyboard->input.notify = handle_keyboard_input;
+    wl_signal_add(&wlr_keyboard->events.key, &keyboard->input);
+    keyboard->destroy.notify = handle_keyboard_destroy;
+    wl_signal_add(&device->events.destroy, &keyboard->destroy);
 
     // サーバーのキーボードリストに追加
     wl_list_insert(&server->keyboards, &keyboard->link);
@@ -119,7 +173,7 @@ int main(int argc, char *argv[]) {
     // サーバをー初期化
     struct morning_server server = {0};
 
-    // wayland displayを作成
+    // waylandディスプレイを作成
     server.display = wl_display_create();
     assert(server.display);
 
@@ -130,12 +184,12 @@ int main(int argc, char *argv[]) {
     // 出力デバイスのリストを作成
     wl_list_init(&server.outputs);
 
+    // キーボードのリストを作成
+    wl_list_init(&server.keyboards);
+
     // 新しい出力デバイスが接続された時のイベントを指定
     server.new_output.notify = new_output_notify;
     wl_signal_add(&server.backend->events.new_output, &server.new_output);
-
-    // キーボードのリストを作成
-    wl_list_init(&server.keyboards);
 
     // 新しい入力デバイスが接続された時のイベントを指定
     server.new_input.notify = new_input_notify;
