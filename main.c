@@ -5,10 +5,13 @@
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
+#include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_xcursor_manager.h>
 #include <xkbcommon/xkbcommon.h>
 
 // waylandサーバー
@@ -26,11 +29,21 @@ struct morning_server {
     struct wlr_output_layout *output_layout;
     // scene graphを管理
     struct wlr_scene *scene;
+    // カーソルを管理
+    struct wlr_cursor *cursor;
+    // カーソルのテーマを管理
+    struct wlr_xcursor_manager *xcursor_manager;
 
     // 新しい入力デバイスの接続を検知するlistener
     struct wl_listener new_input;
     // 新しい出力デバイスの接続を検知するlistener
     struct wl_listener new_output;
+    // カーソルのイベントを検知するlistener
+    struct wl_listener cursor_motion;
+    struct wl_listener cursor_motion_absolute;
+    struct wl_listener cursor_axis;
+    struct wl_listener cursor_button;
+    struct wl_listener cursor_frame;
 
     // 認識されたキーボードのリスト
     struct wl_list keyboards;
@@ -118,8 +131,8 @@ static void handle_keyboard_input(struct wl_listener *listener, void *data) {
 
 // サーバーの終了を検知したときのキーボードに関するイベント
 static void handle_keyboard_destroy(struct wl_listener *listener, void *data) {
-    struct morning_keyboard *keyboard = wl_container_of(listener, keyboard, destroy);
     printf("detected keyboard destroy\n");
+    struct morning_keyboard *keyboard = wl_container_of(listener, keyboard, destroy);
     wl_list_remove(&keyboard->input.link);
     wl_list_remove(&keyboard->destroy.link);
     wl_list_remove(&keyboard->link);
@@ -127,7 +140,7 @@ static void handle_keyboard_destroy(struct wl_listener *listener, void *data) {
 }
 
 // キーボードの初期化
-static void server_new_keyboard(struct morning_server *server, struct wlr_input_device *device) {
+static void attach_new_keyboard(struct morning_server *server, struct wlr_input_device *device) {
 
     // input_deviceからキーボードの情報を取得
     struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
@@ -154,15 +167,26 @@ static void server_new_keyboard(struct morning_server *server, struct wlr_input_
     wl_list_insert(&server->keyboards, &keyboard->link);
 }
 
+// マウスの初期化
+static void attach_new_pointer(struct morning_server *server, struct wlr_input_device *device) {
+    // カーソルにマウスを関連付ける
+    wlr_cursor_attach_input_device(server->cursor, device);
+}
+
 // 新しい入力デバイスが接続された時のイベント
-static void new_input_notify(struct wl_listener *listener, void *data) {
+static void handle_new_input(struct wl_listener *listener, void *data) {
     struct morning_server *server = wl_container_of(listener, server, new_input);
     struct wlr_input_device *wlr_input_device = data;
 
     // デバイスの種類に合わせて初期化
     switch (wlr_input_device->type) {
     case WLR_INPUT_DEVICE_KEYBOARD:
-        server_new_keyboard(server, wlr_input_device);
+        // キーボード
+        attach_new_keyboard(server, wlr_input_device);
+        break;
+    case WLR_INPUT_DEVICE_POINTER:
+        // マウス
+        attach_new_pointer(server, wlr_input_device);
         break;
     default:
         break;
@@ -183,19 +207,11 @@ static void handle_output_frame(struct wl_listener *listener, void *data) {
 
     // sceneの内容をoutputにコミット
     wlr_scene_output_commit(scene_output, NULL);
-
-    // レンダリングの検証用に、画面全体を塗りつぶす
-    wlr_output_attach_render(output->wlr_output, NULL);
-    wlr_renderer_begin(output->server->renderer, output->wlr_output->width, output->wlr_output->height);
-    wlr_renderer_clear(output->server->renderer, (float[]){0.35, 0.45, 0.45, 1});
-    wlr_renderer_end(output->server->renderer);
-    wlr_output_commit(output->wlr_output);
-
     // 今の時間を取得
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    // frameを更新し、タイムスタンプ
+    // フレームを更新し、タイムスタンプ
     wlr_scene_output_send_frame_done(scene_output, &now);
 }
 
@@ -210,7 +226,7 @@ static void handle_output_destroy(struct wl_listener *listener, void *data) {
 }
 
 // 新しい出力デバイスが接続された時のイベント
-static void new_output_notify(struct wl_listener *listener, void *data) {
+static void handle_new_output(struct wl_listener *listener, void *data) {
 
     // サーバーを取得
     struct morning_server *server = wl_container_of(listener, server, new_output);
@@ -257,6 +273,45 @@ static void new_output_notify(struct wl_listener *listener, void *data) {
     wlr_output_state_finish(&state);
 }
 
+// カーソルが動いたときの共通の処理
+static void cursor_motion(struct morning_server *server) {
+    wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager, "default");
+}
+
+// カーソルの(クライアントから見た)相対的な動きを検知したときのイベント
+static void handle_cursor_motion(struct wl_listener *listener, void *data) {
+    printf("detected cursor motion\n");
+    struct morning_server *server = wl_container_of(listener, server, cursor_motion);
+    struct wlr_pointer_motion_event *event = data;
+    wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+    cursor_motion(server);
+}
+
+// カーソルの絶対的な動きを検知したときのイベント
+static void handle_cursor_motion_absolute(struct wl_listener *listener, void *data) {
+    printf("detected cursor motion absolute\n");
+    struct morning_server *server = wl_container_of(listener, server, cursor_motion_absolute);
+    struct wlr_pointer_motion_absolute_event *event = data;
+    wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x, event->y);
+    cursor_motion(server);
+}
+
+// カーソルのホイールの動きを検知したときのイベント
+static void handle_cursor_axis(struct wl_listener *listener, void *data) {
+    printf("detected cursor axis\n");
+}
+
+// カーソルのボタン入力を検知したときのイベント
+static void handle_cursor_button(struct wl_listener *listener, void *data) {
+    printf("detected cursor button\n");
+}
+
+// カーソルのフレームの更新を検知したときのイベント
+// このイベントは、カーソルに関する何かしらの入力があったフレームの最後に発生する
+static void handle_cursor_frame(struct wl_listener *listener, void *data) {
+    printf("detected cursor frame\n");
+}
+
 int main(int argc, char *argv[]) {
 
     // サーバーを初期化
@@ -287,6 +342,15 @@ int main(int argc, char *argv[]) {
     // sceneとoutput_layoutを対応付ける
     wlr_scene_attach_output_layout(server.scene, server.output_layout);
 
+    // cursorを作成
+    server.cursor = wlr_cursor_create();
+
+    // cursorとoutput_layoutを対応付ける
+    wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
+
+    // xcursor_managerを作成
+    server.xcursor_manager = wlr_xcursor_manager_create(NULL, 24);
+
     // 出力デバイスのリストを作成
     wl_list_init(&server.outputs);
 
@@ -294,12 +358,24 @@ int main(int argc, char *argv[]) {
     wl_list_init(&server.keyboards);
 
     // 新しい出力デバイスが接続された時のイベントを指定
-    server.new_output.notify = new_output_notify;
+    server.new_output.notify = handle_new_output;
     wl_signal_add(&server.backend->events.new_output, &server.new_output);
 
     // 新しい入力デバイスが接続された時のイベントを指定
-    server.new_input.notify = new_input_notify;
+    server.new_input.notify = handle_new_input;
     wl_signal_add(&server.backend->events.new_input, &server.new_input);
+
+    // カーソルのイベントを指定
+    server.cursor_motion.notify = handle_cursor_motion;
+    wl_signal_add(&server.cursor->events.motion, &server.cursor_motion);
+    server.cursor_motion_absolute.notify = handle_cursor_motion_absolute;
+    wl_signal_add(&server.cursor->events.motion_absolute, &server.cursor_motion_absolute);
+    server.cursor_button.notify = handle_cursor_button;
+    wl_signal_add(&server.cursor->events.button, &server.cursor_button);
+    server.cursor_axis.notify = handle_cursor_axis;
+    wl_signal_add(&server.cursor->events.axis, &server.cursor_axis);
+    server.cursor_frame.notify = handle_cursor_frame;
+    wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
 
     // backendを有効化
     if (!wlr_backend_start(server.backend)) {
@@ -315,6 +391,7 @@ int main(int argc, char *argv[]) {
     // 終了
     wlr_scene_node_destroy(&server.scene->tree.node);
     wlr_output_layout_destroy(server.output_layout);
+    wlr_xcursor_manager_destroy(server.xcursor_manager);
     wl_display_destroy(server.display);
 
     return 0;
